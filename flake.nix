@@ -10,7 +10,7 @@
     systems.url = "github:nix-systems/default";
   };
 
-  outputs = { self, nixpkgs, home-manager, systems, ... }:
+  outputs = { self, nixpkgs, home-manager, systems, ... }@inputs:
     let
       inherit (nixpkgs) lib;
       version = "0.0.1-ALPHA";
@@ -123,5 +123,19 @@
           # TODO; Tags filtering
         }
       );
+
+      # Run tests with;
+      # nix flake check --print-build-logs --no-eval-cache
+      #
+      # Run tests interactively (for debugging) with;
+      # nix nix build .#checks.x86_64-linux.<ATTRIBUTE NAME, eg: example-test>.driverInteractive && ./result/bin/nixos-test-driver
+      checks = eachSystemOverrideWith flake-enabled-nix
+        (pkgs: lib.optionalAttrs pkgs.stdenv.isLinux {
+          # nixOS tests can only run on Linux hosts
+          example-test = pkgs.testers.runNixOSTest ({ ... }: {
+            imports = [ ./checks/example-test.nix ];
+            _module.args = { inherit inputs; };
+          });
+        });
     };
 }
