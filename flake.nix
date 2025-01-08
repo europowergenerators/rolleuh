@@ -75,14 +75,37 @@
       lib.generateDeployments = flake: eachSystemOverrideWith flake-enabled-nix (pkgs:
         let
           all-hosts = flake.outputs.nixosConfigurations;
+          rolleuh-filter = _name: v: (builtins.hasAttr "rolleuh" v.options) && v.config.rolleuh != null && v.config.rolleuh.enable == true;
           # TODO; Write to stderr if rolleuh options are not set, because now "nix run <>" gives a cryptic error saying the attribute does not exist
-          hosts-to-deploy = lib.attrsets.filterAttrs (_name: v: (builtins.hasAttr "rolleuh" v.options) && v.config.rolleuh != null && v.config.rolleuh.enable == true) all-hosts;
-          into-application = _name: drv: { type = "app"; program = lib.getExe drv; };
+          hosts-to-deploy = lib.attrsets.filterAttrs rolleuh-filter all-hosts;
+          deployments = self.lib.internal.hostDeployments flake pkgs hosts-to-deploy;
+
+          ordered-dag-config = self.lib.internal.constructDag hosts-to-deploy;
+          all-deployment = pkgs.callPackage (import ./packages/all-deployment.nix) { rolleuh-data = { inherit ordered-dag-config deployments; }; };
+        in
+        {
+          rolleuh = lib.mapAttrs (name: binPackage: { type = "app"; program = lib.getExe binPackage; }) deployments;
+          rolleuh-all = { type = "app"; program = lib.getExe all-deployment; };
+        });
+
+      lib.internal.hostDeployments = flake: pkgs: nixosConfigurations:
+        let
           host-deployment-memoized = import ./packages/host-deployment.nix;
           into-deployment = name: host: pkgs.callPackage host-deployment-memoized { rolleuh-data = { inherit flake name host; }; };
-          deployments = lib.mapAttrs into-deployment hosts-to-deploy;
+          deployments = lib.mapAttrs into-deployment nixosConfigurations;
+        in
+        deployments;
 
-          construct-dag = name: host: { data = { runner = lib.getExe deployments.${name}; tags = [ "TODO" ]; }; inherit (host.config.rolleuh) before after; };
+      lib.internal.constructDag = nixosConfigurations:
+        let
+          into-dag-value = name: host: {
+            inherit (host.config.rolleuh) before after; # Ordering information
+            # Attribute set carrying the host related information.
+            # These data will be passed into the deployment packages.
+            data = {
+              inherit (host.config.rolleuh) tags;
+            };
+          };
           dag-eval-config = lib.evalModules {
             modules = [
               ({ ... }: {
@@ -106,23 +129,15 @@
                     default = { };
                   };
                 };
-                config.hosts = lib.mapAttrs construct-dag hosts-to-deploy;
+                config.hosts = lib.mapAttrs into-dag-value nixosConfigurations;
               })
             ];
             class = "rolleuhDagConfig";
           };
           dag-config = lib.showWarnings dag-eval-config.config.warnings dag-eval-config.config;
-          # TODO; Print to stderr if there is no topological sort matching the requirements
-          sorted-dag-config = (home-manager.lib.hm.dag.topoSort dag-config.hosts).result;
-          all-deployment = pkgs.callPackage (import ./packages/all-deployment.nix) { rolleuh-data = { inherit sorted-dag-config; }; };
         in
-        {
-          rolleuh = lib.mapAttrs into-application deployments;
-          rolleuh-all = { type = "app"; program = lib.getExe all-deployment; };
-          # TODO; (??) Add package for deploying a filtered host configuration set
-          # TODO; Tags filtering
-        }
-      );
+        # TODO; Print to stderr if there is no topological sort matching the requirements
+        (home-manager.lib.hm.dag.topoSort dag-config.hosts).result;
 
       # Run tests with;
       # nix flake check --print-build-logs --no-eval-cache
@@ -130,7 +145,34 @@
       # Run tests interactively (for debugging) with;
       # nix nix build .#checks.x86_64-linux.<ATTRIBUTE NAME, eg: example-test>.driverInteractive && ./result/bin/nixos-test-driver
       checks = eachSystemOverrideWith flake-enabled-nix
-        (pkgs: lib.optionalAttrs pkgs.stdenv.isLinux {
+        (pkgs: {
+          build_test =
+            let
+              machine = lib.nixosSystem {
+                system = pkgs.system;
+                modules = [
+                  self.nixosModules.rolleuh
+                  ({ config, ... }: {
+                    networking.hostName = lib.mkForce "machine";
+                    rolleuh = {
+                      enable = true;
+                      sshString = config.networking.hostName;
+                      useSudo = true;
+                      buildOn = "local";
+                      substituteOnTarget = false;
+                      after = [ "before-machine" ];
+                      before = [ "after-machine" ];
+                      tags = [ "check" "example" ];
+                    };
+                  })
+                ];
+              };
+              deployments = self.lib.internal.hostDeployments "<NOFLAKE>" pkgs { inherit machine; };
+              ordered-dag-config = self.lib.internal.constructDag { inherit machine; };
+            in
+            pkgs.callPackage (import ./packages/all-deployment.nix) { rolleuh-data = { inherit ordered-dag-config deployments; }; };
+        }
+        // lib.optionalAttrs pkgs.stdenv.isLinux {
           # nixOS tests can only run on Linux hosts
           example-test = pkgs.testers.runNixOSTest ({ ... }: {
             imports = [ ./checks/example-test.nix ];
